@@ -34,8 +34,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_proxy_url() -> Optional[str]:
-    return os.getenv("GUP_PROXY") or os.getenv("GDRIVE_UPLOAD_PROXY")
-
+    # fallback default if env vars are missing
+    return (
+        os.getenv("GDRIVE_UPLOAD_PROXY")
+        or "socks5://127.0.0.1:1088"
+    )
 
 def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
     if not proxy_url:
@@ -146,7 +149,9 @@ def _upload_file_with_progress(
 }, check_downpath=True)
 async def gupp_(message: Message):
     proxy_url = _get_proxy_url()
+    await message.edit(f"`Using proxy: {proxy_url}`")
     if not proxy_url:
+        await message.err("Set `GUP_PROXY` or `GDRIVE_UPLOAD_PROXY` first.")
         await message.err("Set `GUP_PROXY` or `GDRIVE_UPLOAD_PROXY` first.")
         return
 

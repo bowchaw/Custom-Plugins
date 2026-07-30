@@ -1,4 +1,4 @@
-"""Standalone GDrive upload with dedicated proxy (.gupp only, no gdrive plugin dependency)."""
+"""Standalone GDrive upload with dedicated proxy (.gupp only, no Worker dependency)."""
 
 import asyncio
 import math
@@ -14,18 +14,18 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from httplib2 import Http, ProxyInfo, socks
-from oauth2client.client import OAuth2Credentials
+from oauth2client.client import OAuth2Credentials, HttpAccessTokenRefreshError
 
 from userge import Message, config, get_collection, pool, userge
 from userge.plugins.misc.download import tg_download, url_download
 from userge.utils import humanbytes, is_url, time_formatter
 from userge.utils.exceptions import ProcessCanceled
 
-OAUTH_SCOPE = "https://www.googleapis.com/auth/drive"
-TOKEN_URI = "https://oauth2.googleapis.com/token"
+# Same collection/doc used by official gdrive plugin
+_SAVED_SETTINGS = get_collection("CONFIGS")
+_GDRIVE_DOC_ID = "GDRIVE"
 
-_GDRIVE_COLLECTION = get_collection("CONFIGS")
-_DOC_ID = "GUPP_STANDALONE_CREDS"
+G_DRIVE_FILE_LINK = "📄 <a href='https://drive.google.com/open?id={}'>{}</a> __({})__"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -43,8 +43,8 @@ def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
     if not proxy_url:
         return Http(timeout=timeout)
 
-    p = urlparse(proxy_url)
-    scheme = (p.scheme or "").lower()
+    u = urlparse(proxy_url)
+    scheme = (u.scheme or "").lower()
 
     if scheme.startswith("socks5"):
         ptype = socks.PROXY_TYPE_SOCKS5
@@ -55,55 +55,33 @@ def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
 
     pinfo = ProxyInfo(
         proxy_type=ptype,
-        proxy_host=p.hostname,
-        proxy_port=p.port,
-        proxy_user=p.username,
-        proxy_pass=p.password,
+        proxy_host=u.hostname,
+        proxy_port=u.port,
+        proxy_user=u.username,
+        proxy_pass=u.password,
     )
     return Http(proxy_info=pinfo, timeout=timeout)
 
 
-def _creds_from_env() -> OAuth2Credentials:
-    client_id = os.getenv("G_DRIVE_CLIENT_ID")
-    client_secret = os.getenv("G_DRIVE_CLIENT_SECRET")
-    refresh_token = os.getenv("G_DRIVE_REFRESH_TOKEN")
+async def _load_userge_gdrive_creds() -> Optional[OAuth2Credentials]:
+    doc = await _SAVED_SETTINGS.find_one({"_id": _GDRIVE_DOC_ID}, {"creds": 1})
+    if not doc or "creds" not in doc:
+        return None
+    try:
+        creds = pickle.loads(doc["creds"])  # nosec
+        if isinstance(creds, OAuth2Credentials):
+            return creds
+    except Exception:
+        return None
+    return None
 
-    if not client_id or not client_secret or not refresh_token:
-        raise ValueError(
-            "Missing env vars. Required: G_DRIVE_CLIENT_ID, "
-            "G_DRIVE_CLIENT_SECRET, G_DRIVE_REFRESH_TOKEN"
-        )
 
-    return OAuth2Credentials(
-        access_token=None,
-        client_id=client_id,
-        client_secret=client_secret,
-        refresh_token=refresh_token,
-        token_expiry=None,
-        token_uri=TOKEN_URI,
-        user_agent="Userge-GUPP-Standalone",
-        revoke_uri=None,
-        id_token=None,
-        token_response=None,
-        scopes=[OAUTH_SCOPE],
-        token_info_uri=None,
+async def _save_userge_gdrive_creds(creds: OAuth2Credentials) -> None:
+    await _SAVED_SETTINGS.update_one(
+        {"_id": _GDRIVE_DOC_ID},
+        {"$set": {"creds": pickle.dumps(creds)}},  # nosec
+        upsert=True,
     )
-
-
-async def _resolve_upload_source(message: Message):
-    replied = message.reply_to_message
-    is_input_url = is_url(message.input_str)
-    dl_loc = ""
-
-    if replied and replied.media:
-        dl_loc, _ = await tg_download(message, replied)
-        return dl_loc, True
-
-    if is_input_url:
-        dl_loc, _ = await url_download(message, message.input_str)
-        return dl_loc, True
-
-    return message.input_str, False
 
 
 def _drive_service(creds: OAuth2Credentials, proxy_url: Optional[str]):
@@ -118,29 +96,6 @@ def _set_public_permission(service, file_id: str) -> None:
         body={"role": "reader", "type": "anyone"},
         supportsTeamDrives=True,
     ).execute()
-
-
-def _get_file_link(file_id: str, file_name: str, file_size: int) -> str:
-    return (
-        f"📄 <a href='https://drive.google.com/open?id={file_id}'>{file_name}</a> "
-        f"__({humanbytes(file_size)})__"
-    )
-
-
-def _load_cached_creds_sync() -> Optional[OAuth2Credentials]:
-    # sync context in thread: avoid asyncio loop mixing
-    # if db lookup fails or no creds, fallback to env creds
-    return None
-
-
-def _get_creds_sync(proxy_url: Optional[str]) -> OAuth2Credentials:
-    # Keep it fully sync in worker thread:
-    # 1) build from env
-    # 2) refresh token through proxy-aware http
-    creds = _creds_from_env()
-    http = _build_proxy_http(proxy_url)
-    creds.refresh(http)
-    return creds
 
 
 def _upload_file_with_progress(
@@ -168,18 +123,8 @@ def _upload_file_with_progress(
     chunk_mb = int(os.getenv("GUP_CHUNK_MB", "64"))
     chunk_size = max(1, chunk_mb) * 1024 * 1024
 
-    media = MediaFileUpload(
-        file_path,
-        mimetype=mime_type,
-        chunksize=chunk_size,
-        resumable=True,
-    )
-
-    req = service.files().create(
-        body=body,
-        media_body=media,
-        supportsTeamDrives=True,
-    )
+    media = MediaFileUpload(file_path, mimetype=mime_type, chunksize=chunk_size, resumable=True)
+    req = service.files().create(body=body, media_body=media, supportsTeamDrives=True)
 
     started = time.time()
     response = None
@@ -201,29 +146,54 @@ def _upload_file_with_progress(
     return response.get("id")
 
 
-@userge.on_cmd(
-    "gupp",
-    about={
-        "header": "Upload to GDrive using dedicated proxy (standalone)",
-        "usage": "{tr}gupp <file_path_or_url> OR reply to media",
-        "description": (
-            "Uses GUP_PROXY or GDRIVE_UPLOAD_PROXY for token refresh and upload traffic. "
-            "Does not depend on gdrive plugin."
-        ),
-    },
-    check_downpath=True,
-)
+@userge.on_cmd("gupp", about={
+    "header": "Upload to GDrive using dedicated proxy (standalone)",
+    "usage": "{tr}gupp <file_path_or_url> OR reply to media",
+    "description": "Uses GUP_PROXY or GDRIVE_UPLOAD_PROXY; uses creds saved by .gsetup/.gconf."
+}, check_downpath=True)
 async def gupp_(message: Message):
     proxy_url = _get_proxy_url()
     if not proxy_url:
         await message.err("Set `GUP_PROXY` or `GDRIVE_UPLOAD_PROXY` first.")
         return
 
+    # Use same env vars style as gdrive plugin
     parent_id = os.getenv("G_DRIVE_PARENT_ID", "").strip()
     is_td = _env_bool("G_DRIVE_IS_TD", False)
 
+    creds = await _load_userge_gdrive_creds()
+    if not creds:
+        await message.err("GDrive creds not found in DB. Run `.gsetup` and `.gconf` once.")
+        return
+
+    # refresh token via proxy-aware transport
     try:
-        source_path, is_temp = await _resolve_upload_source(message)
+        await pool.run_in_thread(creds.refresh)(_build_proxy_http(proxy_url))
+        await _save_userge_gdrive_creds(creds)
+    except HttpAccessTokenRefreshError as e:
+        await message.err(f"Token refresh failed: {e}")
+        return
+    except Exception as e:
+        await message.err(f"Failed to refresh creds: {e}")
+        return
+
+    # resolve source
+    try:
+        replied = message.reply_to_message
+        is_input_url = is_url(message.input_str)
+        dl_loc = ""
+
+        if replied and replied.media:
+            dl_loc, _ = await tg_download(message, replied)
+            source_path = dl_loc
+            is_temp = True
+        elif is_input_url:
+            dl_loc, _ = await url_download(message, message.input_str)
+            source_path = dl_loc
+            is_temp = True
+        else:
+            source_path = message.input_str
+            is_temp = False
     except ProcessCanceled:
         await message.canceled()
         return
@@ -236,10 +206,10 @@ async def gupp_(message: Message):
         return
 
     if os.path.isdir(source_path):
-        await message.err("This standalone `.gupp` supports file upload only (not folders).")
+        await message.err("This standalone `.gupp` supports file upload only.")
         return
 
-    await message.edit("`Initializing standalone GDrive upload via proxy...`")
+    await message.edit("`Uploading to GDrive using dedicated proxy...`")
 
     progress_text = {"value": None}
     canceled = {"value": False}
@@ -271,9 +241,7 @@ async def gupp_(message: Message):
 
     def _runner():
         try:
-            creds = _get_creds_sync(proxy_url)
             service = _drive_service(creds, proxy_url)
-
             file_id = _upload_file_with_progress(
                 service=service,
                 file_path=source_path,
@@ -287,7 +255,7 @@ async def gupp_(message: Message):
 
             file_name = os.path.basename(source_path)
             file_size = os.path.getsize(source_path)
-            output["value"] = _get_file_link(file_id, file_name, file_size)
+            output["value"] = G_DRIVE_FILE_LINK.format(file_id, file_name, humanbytes(file_size))
 
         except ProcessCanceled:
             output["value"] = "`Process Canceled!`"

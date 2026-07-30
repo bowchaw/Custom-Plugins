@@ -1,4 +1,4 @@
-"""Standalone GDrive upload with dedicated proxy (.gupp only, no Worker dependency)."""
+"""Standalone GDrive upload with dedicated proxy (.gupp only, no gdrive Worker dependency)."""
 
 import asyncio
 import math
@@ -14,17 +14,15 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from httplib2 import Http, ProxyInfo, socks
-from oauth2client.client import OAuth2Credentials, HttpAccessTokenRefreshError
+from oauth2client.client import OAuth2Credentials
 
 from userge import Message, config, get_collection, pool, userge
 from userge.plugins.misc.download import tg_download, url_download
 from userge.utils import humanbytes, is_url, time_formatter
 from userge.utils.exceptions import ProcessCanceled
 
-# Same collection/doc used by official gdrive plugin
 _SAVED_SETTINGS = get_collection("CONFIGS")
 _GDRIVE_DOC_ID = "GDRIVE"
-
 G_DRIVE_FILE_LINK = "📄 <a href='https://drive.google.com/open?id={}'>{}</a> __({})__"
 
 
@@ -45,7 +43,6 @@ def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
 
     u = urlparse(proxy_url)
     scheme = (u.scheme or "").lower()
-
     if scheme.startswith("socks5"):
         ptype = socks.PROXY_TYPE_SOCKS5
     elif scheme.startswith("socks4"):
@@ -63,7 +60,7 @@ def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
     return Http(proxy_info=pinfo, timeout=timeout)
 
 
-async def _load_userge_gdrive_creds() -> Optional[OAuth2Credentials]:
+async def _load_creds_from_userge_db() -> Optional[OAuth2Credentials]:
     doc = await _SAVED_SETTINGS.find_one({"_id": _GDRIVE_DOC_ID}, {"creds": 1})
     if not doc or "creds" not in doc:
         return None
@@ -76,17 +73,11 @@ async def _load_userge_gdrive_creds() -> Optional[OAuth2Credentials]:
     return None
 
 
-async def _save_userge_gdrive_creds(creds: OAuth2Credentials) -> None:
-    await _SAVED_SETTINGS.update_one(
-        {"_id": _GDRIVE_DOC_ID},
-        {"$set": {"creds": pickle.dumps(creds)}},  # nosec
-        upsert=True,
-    )
-
-
-def _drive_service(creds: OAuth2Credentials, proxy_url: Optional[str]):
-    http = _build_proxy_http(proxy_url)
-    authed_http = creds.authorize(http)
+def _build_service_with_creds_and_proxy(creds: OAuth2Credentials, proxy_url: Optional[str]):
+    # IMPORTANT:
+    # creds are already valid from gdrive plugin runtime/DB.
+    # We do NOT force refresh through proxy to avoid bad proxy OAuth redirects.
+    authed_http = creds.authorize(_build_proxy_http(proxy_url))
     return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 
@@ -94,7 +85,7 @@ def _set_public_permission(service, file_id: str) -> None:
     service.permissions().create(
         fileId=file_id,
         body={"role": "reader", "type": "anyone"},
-        supportsTeamDrives=True,
+        supportsTeamDrives=True
     ).execute()
 
 
@@ -103,7 +94,7 @@ def _upload_file_with_progress(
     file_path: str,
     parent_id: str,
     progress_cb,
-    is_canceled_cb,
+    is_canceled_cb
 ) -> str:
     if is_canceled_cb():
         raise ProcessCanceled
@@ -120,28 +111,30 @@ def _upload_file_with_progress(
     if parent_id:
         body["parents"] = [parent_id]
 
-    chunk_mb = int(os.getenv("GUP_CHUNK_MB", "64"))
-    chunk_size = max(1, chunk_mb) * 1024 * 1024
+    chunk_mb = int(os.getenv("GUP_CHUNK_MB", "50"))  # match Userge default style
+    media = MediaFileUpload(
+        file_path,
+        mimetype=mime_type,
+        chunksize=max(1, chunk_mb) * 1024 * 1024,
+        resumable=True
+    )
 
-    media = MediaFileUpload(file_path, mimetype=mime_type, chunksize=chunk_size, resumable=True)
     req = service.files().create(body=body, media_body=media, supportsTeamDrives=True)
 
-    started = time.time()
+    c_time = time.time()
     response = None
-
     while response is None:
         if is_canceled_cb():
             raise ProcessCanceled
-
         status, response = req.next_chunk(num_retries=5)
         if status:
             total = status.total_size or file_size
             uploaded = status.resumable_progress
-            elapsed = max(time.time() - started, 0.001)
-            speed = uploaded / elapsed
-            percent = (uploaded / total) * 100 if total else 0.0
-            eta = int((total - uploaded) / speed) if speed > 0 and total > uploaded else 0
-            progress_cb(file_name, total, uploaded, percent, speed, eta)
+            diff = max(time.time() - c_time, 0.001)
+            speed = round(uploaded / diff, 2)
+            percentage = (uploaded / total) * 100 if total else 0
+            eta = round((total - uploaded) / speed) if speed and total > uploaded else 0
+            progress_cb(file_name, total, uploaded, percentage, speed, eta)
 
     return response.get("id")
 
@@ -149,7 +142,7 @@ def _upload_file_with_progress(
 @userge.on_cmd("gupp", about={
     "header": "Upload to GDrive using dedicated proxy (standalone)",
     "usage": "{tr}gupp <file_path_or_url> OR reply to media",
-    "description": "Uses GUP_PROXY or GDRIVE_UPLOAD_PROXY; uses creds saved by .gsetup/.gconf."
+    "description": "Uses proxy only for upload transport. Uses creds saved by official .gsetup/.gconf."
 }, check_downpath=True)
 async def gupp_(message: Message):
     proxy_url = _get_proxy_url()
@@ -157,27 +150,22 @@ async def gupp_(message: Message):
         await message.err("Set `GUP_PROXY` or `GDRIVE_UPLOAD_PROXY` first.")
         return
 
-    # Use same env vars style as gdrive plugin
+    creds = await _load_creds_from_userge_db()
+    if not creds:
+        await message.err("No GDrive creds in DB. Run official `.gsetup` + `.gconf` first.")
+        return
+
+    # If token expired, do NOT refresh via proxy here (causes your redirect error on bad proxy).
+    if creds.access_token_expired:
+        await message.err(
+            "Stored token is expired. Run official `.gsetup`/`.gconf` (or `.gup` once) to refresh creds, then retry `.gupp`."
+        )
+        return
+
     parent_id = os.getenv("G_DRIVE_PARENT_ID", "").strip()
     is_td = _env_bool("G_DRIVE_IS_TD", False)
 
-    creds = await _load_userge_gdrive_creds()
-    if not creds:
-        await message.err("GDrive creds not found in DB. Run `.gsetup` and `.gconf` once.")
-        return
-
-    # refresh token via proxy-aware transport
-    try:
-        await pool.run_in_thread(creds.refresh)(_build_proxy_http(proxy_url))
-        await _save_userge_gdrive_creds(creds)
-    except HttpAccessTokenRefreshError as e:
-        await message.err(f"Token refresh failed: {e}")
-        return
-    except Exception as e:
-        await message.err(f"Failed to refresh creds: {e}")
-        return
-
-    # resolve source
+    # resolve input
     try:
         replied = message.reply_to_message
         is_input_url = is_url(message.input_str)
@@ -202,18 +190,17 @@ async def gupp_(message: Message):
         return
 
     if not source_path or not os.path.exists(source_path):
-        await message.err("Invalid file path/source.")
+        await message.err("invalid file path provided?")
         return
-
     if os.path.isdir(source_path):
-        await message.err("This standalone `.gupp` supports file upload only.")
+        await message.err("This `.gupp` supports file upload only, not folders.")
         return
 
-    await message.edit("`Uploading to GDrive using dedicated proxy...`")
+    await message.edit("`Loading standalone GDrive Upload via proxy...`")
 
     progress_text = {"value": None}
-    canceled = {"value": False}
     finished = {"value": False}
+    canceled = {"value": False}
     output = {"value": None}
     start_t = datetime.now()
 
@@ -226,8 +213,8 @@ async def gupp_(message: Message):
     def _progress_cb(name, total, uploaded, percent, speed, eta):
         done = math.floor(percent / 5)
         bar = (
-            "".join(config.FINISHED_PROGRESS_STR for _ in range(done))
-            + "".join(config.UNFINISHED_PROGRESS_STR for _ in range(20 - done))
+            "".join(config.FINISHED_PROGRESS_STR for _ in range(done)) +
+            "".join(config.UNFINISHED_PROGRESS_STR for _ in range(20 - done))
         )
         progress_text["value"] = (
             "__Uploading to GDrive (Proxy)...__\n"
@@ -241,7 +228,7 @@ async def gupp_(message: Message):
 
     def _runner():
         try:
-            service = _drive_service(creds, proxy_url)
+            service = _build_service_with_creds_and_proxy(creds, proxy_url)
             file_id = _upload_file_with_progress(
                 service=service,
                 file_path=source_path,
@@ -249,20 +236,17 @@ async def gupp_(message: Message):
                 progress_cb=_progress_cb,
                 is_canceled_cb=_is_canceled,
             )
-
             if not is_td:
                 _set_public_permission(service, file_id)
-
             file_name = os.path.basename(source_path)
             file_size = os.path.getsize(source_path)
             output["value"] = G_DRIVE_FILE_LINK.format(file_id, file_name, humanbytes(file_size))
-
         except ProcessCanceled:
             output["value"] = "`Process Canceled!`"
-        except HttpError as he:
-            output["value"] = f"**ERROR** : `{he._get_reason()}`"  # pylint: disable=protected-access
-        except Exception as ex:
-            output["value"] = f"**ERROR** : `{ex}`"
+        except HttpError as h_e:
+            output["value"] = f"**ERROR** : `{h_e._get_reason()}`"  # pylint: disable=protected-access
+        except Exception as e:
+            output["value"] = f"**ERROR** : `{e}`"
         finally:
             finished["value"] = True
 
@@ -280,18 +264,16 @@ async def gupp_(message: Message):
         except Exception:
             pass
 
-    elapsed = (datetime.now() - start_t).seconds
-    out = output["value"]
-
-    if out is None:
-        await message.edit("`failed to upload.. check logs?`")
-    elif out == "`Process Canceled!`":
-        await message.edit(out)
-    elif out.startswith("**ERROR**"):
-        await message.edit(out, disable_web_page_preview=True)
-    else:
+    m_s = (datetime.now() - start_t).seconds
+    if isinstance(output["value"], str) and output["value"].startswith("**ERROR**"):
+        await message.edit(output["value"], disable_web_page_preview=True)
+    elif output["value"] == "`Process Canceled!`":
+        await message.edit(output["value"])
+    elif output["value"]:
         await message.edit(
-            f"**Uploaded Successfully** __in {elapsed} seconds__\n\n{out}",
+            f"**Uploaded Successfully** __in {m_s} seconds__\n\n{output['value']}",
             disable_web_page_preview=True,
             log=__name__,
         )
+    else:
+        await message.edit("`failed to upload.. check logs?`")

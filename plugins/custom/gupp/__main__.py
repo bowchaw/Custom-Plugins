@@ -21,23 +21,6 @@ from userge.plugins.misc.download import tg_download, url_download
 from userge.utils import humanbytes, is_url, time_formatter
 from userge.utils.exceptions import ProcessCanceled
 
-# =========================
-# Config env vars required:
-# =========================
-# G_DRIVE_CLIENT_ID
-# G_DRIVE_CLIENT_SECRET
-# G_DRIVE_REFRESH_TOKEN
-#
-# Optional:
-# G_DRIVE_PARENT_ID
-# G_DRIVE_IS_TD=true/false
-# GUP_PROXY or GDRIVE_UPLOAD_PROXY   (required for .gupp behavior)
-# GUP_CHUNK_MB (default 64)
-#
-# NOTE:
-# This plugin intentionally supports ONLY upload command `.gupp`.
-# It does not depend on UsergeTeam gdrive plugin internals.
-
 OAUTH_SCOPE = "https://www.googleapis.com/auth/drive"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
@@ -64,38 +47,20 @@ def _build_proxy_http(proxy_url: Optional[str], timeout: int = 120) -> Http:
     scheme = (p.scheme or "").lower()
 
     if scheme.startswith("socks5"):
-        proxy_type = socks.PROXY_TYPE_SOCKS5
+        ptype = socks.PROXY_TYPE_SOCKS5
     elif scheme.startswith("socks4"):
-        proxy_type = socks.PROXY_TYPE_SOCKS4
+        ptype = socks.PROXY_TYPE_SOCKS4
     else:
-        proxy_type = socks.PROXY_TYPE_HTTP
+        ptype = socks.PROXY_TYPE_HTTP
 
     pinfo = ProxyInfo(
-        proxy_type=proxy_type,
+        proxy_type=ptype,
         proxy_host=p.hostname,
         proxy_port=p.port,
         proxy_user=p.username,
         proxy_pass=p.password,
     )
     return Http(proxy_info=pinfo, timeout=timeout)
-
-
-async def _load_cached_creds() -> Optional[OAuth2Credentials]:
-    doc = await _GDRIVE_COLLECTION.find_one({"_id": _DOC_ID}, {"creds": 1})
-    if not doc or "creds" not in doc:
-        return None
-    try:
-        return pickle.loads(doc["creds"])  # nosec
-    except Exception:
-        return None
-
-
-async def _save_cached_creds(creds: OAuth2Credentials) -> None:
-    await _GDRIVE_COLLECTION.update_one(
-        {"_id": _DOC_ID},
-        {"$set": {"creds": pickle.dumps(creds)}},  # nosec
-        upsert=True,
-    )
 
 
 def _creds_from_env() -> OAuth2Credentials:
@@ -125,18 +90,20 @@ def _creds_from_env() -> OAuth2Credentials:
     )
 
 
-async def _get_creds(proxy_url: Optional[str]) -> OAuth2Credentials:
-    creds = await _load_cached_creds()
-    if creds is None:
-        creds = _creds_from_env()
+async def _resolve_upload_source(message: Message):
+    replied = message.reply_to_message
+    is_input_url = is_url(message.input_str)
+    dl_loc = ""
 
-    # Refresh token via proxy-aware Http
-    http = _build_proxy_http(proxy_url)
-    if (not creds.access_token) or creds.access_token_expired:
-        await pool.run_in_thread(creds.refresh)(http)
-        await _save_cached_creds(creds)
+    if replied and replied.media:
+        dl_loc, _ = await tg_download(message, replied)
+        return dl_loc, True
 
-    return creds
+    if is_input_url:
+        dl_loc, _ = await url_download(message, message.input_str)
+        return dl_loc, True
+
+    return message.input_str, False
 
 
 def _drive_service(creds: OAuth2Credentials, proxy_url: Optional[str]):
@@ -160,24 +127,20 @@ def _get_file_link(file_id: str, file_name: str, file_size: int) -> str:
     )
 
 
-def _resolve_upload_source(message: Message):
-    """Resolve source from reply media, URL, or local path."""
-    async def _inner():
-        replied = message.reply_to_message
-        is_input_url = is_url(message.input_str)
-        dl_loc = ""
+def _load_cached_creds_sync() -> Optional[OAuth2Credentials]:
+    # sync context in thread: avoid asyncio loop mixing
+    # if db lookup fails or no creds, fallback to env creds
+    return None
 
-        if replied and replied.media:
-            dl_loc, _ = await tg_download(message, replied)
-            return dl_loc, True
 
-        if is_input_url:
-            dl_loc, _ = await url_download(message, message.input_str)
-            return dl_loc, True
-
-        return message.input_str, False
-
-    return _inner()
+def _get_creds_sync(proxy_url: Optional[str]) -> OAuth2Credentials:
+    # Keep it fully sync in worker thread:
+    # 1) build from env
+    # 2) refresh token through proxy-aware http
+    creds = _creds_from_env()
+    http = _build_proxy_http(proxy_url)
+    creds.refresh(http)
+    return creds
 
 
 def _upload_file_with_progress(
@@ -274,11 +237,6 @@ async def gupp_(message: Message):
 
     if os.path.isdir(source_path):
         await message.err("This standalone `.gupp` supports file upload only (not folders).")
-        if is_temp and os.path.exists(source_path):
-            try:
-                os.remove(source_path)
-            except Exception:
-                pass
         return
 
     await message.edit("`Initializing standalone GDrive upload via proxy...`")
@@ -296,10 +254,10 @@ async def gupp_(message: Message):
         return canceled["value"]
 
     def _progress_cb(name, total, uploaded, percent, speed, eta):
-        bar_done = math.floor(percent / 5)
+        done = math.floor(percent / 5)
         bar = (
-            "".join(config.FINISHED_PROGRESS_STR for _ in range(bar_done))
-            + "".join(config.UNFINISHED_PROGRESS_STR for _ in range(20 - bar_done))
+            "".join(config.FINISHED_PROGRESS_STR for _ in range(done))
+            + "".join(config.UNFINISHED_PROGRESS_STR for _ in range(20 - done))
         )
         progress_text["value"] = (
             "__Uploading to GDrive (Proxy)...__\n"
@@ -313,7 +271,7 @@ async def gupp_(message: Message):
 
     def _runner():
         try:
-            creds = asyncio.run(_get_creds(proxy_url))
+            creds = _get_creds_sync(proxy_url)
             service = _drive_service(creds, proxy_url)
 
             file_id = _upload_file_with_progress(
@@ -348,7 +306,6 @@ async def gupp_(message: Message):
                 await message.edit(progress_text["value"])
             await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
 
-    # cleanup temp download
     if is_temp and os.path.exists(source_path):
         try:
             os.remove(source_path)

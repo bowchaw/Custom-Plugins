@@ -49,7 +49,6 @@ async def godl_command(message: Message):
     user_agent = "Mozilla/5.0 (Linux; Android 16; 24069PC21I) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.91 Mobile Safari/537.36"
     language = "en-US" 
     
-    # Isolate session from global proxies
     session = requests.Session()
     session.proxies = {"http": None, "https": None}
     session.headers.update({
@@ -59,7 +58,6 @@ async def godl_command(message: Message):
         "Referer": "https://gofile.io/"
     })
         
-    # Fetch Obfuscated JS & Generate Website Token via qjs
     try:
         js_code = session.get("https://gofile.io/js/wt.obf.js").text
         js_wrapper = f"""
@@ -88,7 +86,6 @@ async def godl_command(message: Message):
         "X-BL": language
     })
     
-    # Fetch API JSON
     api_url = f"https://api.gofile.io/contents/{folder_id}"
     content_data = session.get(api_url).json()
 
@@ -120,19 +117,18 @@ async def godl_command(message: Message):
         await message.edit("`No files found to download.`")
         return
 
-    # Process Downloads Iteratively
     for name, link in files_to_download:
         if not link:
             continue
             
         await message.edit(f"`Adding {name} to Aria2...`")
         
-        # Send to Aria2 with account cookie
+        # Set to 14 connections as requested
         options = {
             "header": [f"Cookie: accountToken={account_token}"],
             "out": name,
-            "max-connection-per-server": "16",
-            "split": "16"
+            "max-connection-per-server": "14",
+            "split": "14"
         }
         
         res = aria2_rpc("aria2.addUri", [[link], options])
@@ -156,7 +152,8 @@ async def godl_command(message: Message):
                 await message.edit(f"**GoFile Download Complete!**\n📁 `{name}`\n⏱ `{elapsed}s`")
                 break
             elif status == "error":
-                await message.edit(f"`Download failed for {name}`")
+                err_info = status_res.get("errorMessage", "Unknown error")
+                await message.edit(f"`Download failed for {name}: {err_info}`")
                 break
             elif status == "active":
                 completed = int(status_res.get("completedLength", 0))
@@ -180,4 +177,5 @@ async def godl_command(message: Message):
                     except Exception:
                         pass
             
-            await asyncio.sleep(3)
+            # Increased to 10 seconds to prevent Telegram flood waits
+            await asyncio.sleep(10)

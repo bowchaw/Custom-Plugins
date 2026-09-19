@@ -20,7 +20,6 @@ def aria2_rpc(method, params=None):
         "params": params or []
     }
     try:
-        # Explicitly ignore global proxies for local daemon connection
         response = requests.post(RPC_URL, json=payload, timeout=5, proxies={"http": None, "https": None})
         return response.json().get("result")
     except Exception:
@@ -35,7 +34,13 @@ async def direct_aria_download(message: Message):
 
     await message.edit("`Adding download task to Aria2...`")
     
-    res = aria2_rpc("aria2.addUri", [[url]])
+    # Using 14 connections as requested
+    options = {
+        "max-connection-per-server": "14",
+        "split": "14"
+    }
+    
+    res = aria2_rpc("aria2.addUri", [[url], options])
     if not res:
         await message.edit("`Failed to connect to Aria2 daemon or invalid response.`")
         return
@@ -75,11 +80,21 @@ async def direct_aria_download(message: Message):
             total = int(status_res.get("totalLength", 1))
             speed = int(status_res.get("downloadSpeed", 0))
             
+            # Fetch filename dynamically
+            files_info = status_res.get("files", [{}])[0]
+            if files_info.get("path"):
+                active_file_name = files_info["path"].split('/')[-1]
+            elif files_info.get("uris"):
+                active_file_name = files_info["uris"][0].get("uri", "Unknown").split('/')[-1]
+            else:
+                active_file_name = "Allocating..."
+
             percentage = (completed / total) * 100 if total > 0 else 0
             eta = (total - completed) / speed if speed > 0 else 0
             
             progress_str = (
                 f"📥 **Downloading...**\n"
+                f"📁 **File:** `{active_file_name}`\n"
                 f"📊 **Progress:** `{percentage:.2f}%` ({format_bytes(completed)} / {format_bytes(total)})\n"
                 f"🚀 **Speed:** `{format_bytes(speed)}/s`\n"
                 f"⏳ **ETA:** `{int(eta)}s`"
@@ -92,5 +107,5 @@ async def direct_aria_download(message: Message):
                 except Exception:
                     pass
         
-        # Async sleep prevents bot from freezing
-        await asyncio.sleep(3)
+        # Increased to 10 seconds to prevent Telegram flood waits
+        await asyncio.sleep(10)

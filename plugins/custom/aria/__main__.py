@@ -140,7 +140,6 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
 
 
 
-
 @userge.on_cmd("dl", about={
     'header': "Download files to server from torrent or magnet using aria2p",
     'usage': "{tr}adownload [url/magnet | reply to torrent file]",
@@ -155,8 +154,8 @@ async def t_url_download(message: Message):
     myoptions = {
              "dir": os.path.join("/app", Config.Dynamic.DOWN_PATH)
         }
-    if (message.reply_to_message and 
-           message.reply_to_message.document and 
+    if (message.reply_to_message and
+           message.reply_to_message.document and
            message.reply_to_message.document.file_name.lower().endswith(
             ('.torrent'))):
         resource = message.reply_to_message
@@ -174,6 +173,16 @@ async def t_url_download(message: Message):
             return await message.err(str(e))
     elif message.input_str:
         resource = message.filtered_input_str
+
+        # NEW: split on "|" for an optional custom filename
+        custom_name = None
+        if "|" in resource:
+            resource, custom_name = resource.split("|", 1)
+            resource = resource.strip()
+            custom_name = custom_name.strip()
+            if custom_name:
+                myoptions["out"] = custom_name
+
         is_url = True
         if resource.lower().startswith("http"):
             try:  # Add URL Into Queue

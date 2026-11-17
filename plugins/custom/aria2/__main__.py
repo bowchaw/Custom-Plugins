@@ -27,24 +27,35 @@ def aria2_rpc(method, params=None):
 
 @userge.on_cmd("ddl", about={"header": "Download file using aria2 RPC"})
 async def direct_aria_download(message: Message):
-    url = message.input_str
-    if not url:
+    raw_input = message.input_str
+    if not raw_input:
         await message.edit("`Please provide a URL to download!`")
         return
 
+    # NEW: split on "|" to allow an optional custom filename
+    custom_name = None
+    if "|" in raw_input:
+        url, custom_name = raw_input.split("|", 1)
+        url = url.strip()
+        custom_name = custom_name.strip()
+    else:
+        url = raw_input.strip()
+
     await message.edit("`Adding download task to Aria2...`")
-    
-    # Using 14 connections as requested
+
     options = {
         "max-connection-per-server": "14",
         "split": "14"
     }
-    
+    # NEW: force aria2 to save under the given name
+    if custom_name:
+        options["out"] = custom_name
+
     res = aria2_rpc("aria2.addUri", [[url], options])
     if not res:
         await message.edit("`Failed to connect to Aria2 daemon or invalid response.`")
         return
-    
+
     gid = res
     start_time = time.time()
     last_msg = ""
